@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -9,6 +9,95 @@ from utils_io import list_images
 
 FocusMeasureName = Literal["laplacian", "tenengrad"]
 ColormapName = Literal["TURBO", "JET", "VIRIDIS"]
+
+
+def _clean_binary_mask(mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+    """Denoise a binary mask using close/open morphology."""
+    ksize = max(3, int(kernel_size) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+    return cleaned
+
+
+def detect_lesion_object(
+    depth_idx: np.ndarray,
+    confidence: Optional[np.ndarray] = None,
+    min_area_px: int = 150,
+) -> Optional[Dict[str, np.ndarray | float | Tuple[int, int, int, int]]]:
+    """Detect lesion object from depth saliency and return geometric metrics.
+
+    Returns:
+        Dict with keys: mask, contour, bbox, area_px, equiv_diameter_px,
+        major_axis_px, minor_axis_px. Returns None if no valid region is found.
+    """
+    if depth_idx.ndim != 2:
+        return None
+
+    depth_f = depth_idx.astype(np.float32)
+    h, w = depth_f.shape
+    if h < 8 or w < 8:
+        return None
+
+    pad_h = max(1, h // 10)
+    pad_w = max(1, w // 10)
+    border_vals = np.concatenate(
+        [
+            depth_f[:pad_h, :].ravel(),
+            depth_f[-pad_h:, :].ravel(),
+            depth_f[:, :pad_w].ravel(),
+            depth_f[:, -pad_w:].ravel(),
+        ]
+    )
+    baseline = float(np.median(border_vals))
+
+    saliency = np.abs(depth_f - baseline)
+    if confidence is not None and confidence.shape == depth_f.shape:
+        conf = np.clip(confidence.astype(np.float32), 0.0, 1.0)
+        saliency = saliency * (0.25 + 0.75 * conf)
+
+    saliency_u8 = cv2.normalize(saliency, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, raw_mask = cv2.threshold(saliency_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = _clean_binary_mask(raw_mask, kernel_size=5)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    image_area = float(h * w)
+    valid_contours = []
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < float(min_area_px):
+            continue
+        if area > 0.9 * image_area:
+            continue
+        valid_contours.append(contour)
+
+    if not valid_contours:
+        return None
+
+    lesion_contour = max(valid_contours, key=cv2.contourArea)
+    area_px = float(cv2.contourArea(lesion_contour))
+    x, y, bw, bh = cv2.boundingRect(lesion_contour)
+
+    (_, _), (rect_w, rect_h), _ = cv2.minAreaRect(lesion_contour)
+    major_axis_px = float(max(rect_w, rect_h))
+    minor_axis_px = float(min(rect_w, rect_h))
+    equiv_diameter_px = float(np.sqrt((4.0 * area_px) / np.pi))
+
+    lesion_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(lesion_mask, [lesion_contour], -1, color=255, thickness=-1)
+
+    return {
+        "mask": lesion_mask,
+        "contour": lesion_contour,
+        "bbox": (x, y, bw, bh),
+        "area_px": area_px,
+        "equiv_diameter_px": equiv_diameter_px,
+        "major_axis_px": major_axis_px,
+        "minor_axis_px": minor_axis_px,
+    }
 
 
 def load_stack(folder: Path) -> List[np.ndarray]:

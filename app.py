@@ -9,7 +9,7 @@ import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 
-from sff import compute_depth_index, depth_index_to_heatmap, load_stack
+from sff import compute_depth_index, depth_index_to_heatmap, detect_lesion_object, load_stack
 from utils_io import list_images, save_image
 
 
@@ -332,6 +332,15 @@ def main() -> None:
             st.session_state.pop("calibration", None)
             st.rerun()
 
+    pixels_per_mm = st.sidebar.number_input(
+        "Pixels per mm (optional)",
+        min_value=0.0,
+        value=0.0,
+        step=0.1,
+        format="%.2f",
+        help="Set if you have lateral scale calibration. 0 disables mm size conversion.",
+    )
+
     run_clicked = st.sidebar.button("Run SFF", type="primary")
     save_clicked = st.sidebar.button("Save Outputs")
 
@@ -510,6 +519,54 @@ def main() -> None:
             st.session_state["fig_3d"] = fig_3d
             st.session_state["signed_height"] = signed_height
 
+        st.subheader("Lesion Detection & Size")
+        lesion = detect_lesion_object(depth_idx, confidence=confidence, min_area_px=150)
+        st.session_state["lesion_detection"] = lesion
+
+        if lesion is None:
+            st.info("No clear lesion candidate detected. Try a cleaner stack or adjust capture quality.")
+        else:
+            lesion_mask = lesion["mask"]
+            lesion_contour = lesion["contour"]
+            x, y, bw, bh = lesion["bbox"]
+
+            overlay = cv2.cvtColor(_to_display_gray_u8(depth_idx), cv2.COLOR_GRAY2BGR)
+            cv2.drawContours(overlay, [lesion_contour], -1, (0, 255, 255), 2)
+            cv2.rectangle(overlay, (x, y), (x + bw, y + bh), (255, 0, 255), 2)
+
+            st.session_state["lesion_overlay_bgr"] = overlay
+            st.session_state["lesion_mask"] = lesion_mask
+
+            det_col1, det_col2 = st.columns(2)
+            with det_col1:
+                st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), caption="Detected lesion contour and bounding box", use_column_width=True)
+            with det_col2:
+                st.image(lesion_mask, caption="Lesion mask", clamp=True, use_column_width=True)
+
+            area_px = float(lesion["area_px"])
+            equiv_diameter_px = float(lesion["equiv_diameter_px"])
+            major_axis_px = float(lesion["major_axis_px"])
+            minor_axis_px = float(lesion["minor_axis_px"])
+
+            st.markdown(
+                f"**Pixel size estimates:** Area = `{area_px:.1f}` px² | "
+                f"Equivalent diameter = `{equiv_diameter_px:.2f}` px | "
+                f"Major axis = `{major_axis_px:.2f}` px | Minor axis = `{minor_axis_px:.2f}` px"
+            )
+
+            if pixels_per_mm > 0:
+                area_mm2 = area_px / (pixels_per_mm * pixels_per_mm)
+                equiv_diameter_mm = equiv_diameter_px / pixels_per_mm
+                major_axis_mm = major_axis_px / pixels_per_mm
+                minor_axis_mm = minor_axis_px / pixels_per_mm
+                st.markdown(
+                    f"**Actual lesion size:** Area = `{area_mm2:.2f}` mm² | "
+                    f"Equivalent diameter = `{equiv_diameter_mm:.2f}` mm | "
+                    f"Major axis = `{major_axis_mm:.2f}` mm | Minor axis = `{minor_axis_mm:.2f}` mm"
+                )
+            else:
+                st.info("Set 'Pixels per mm' in the sidebar to output actual lesion size in millimeters.")
+
     if save_clicked:
         if "depth_idx" not in st.session_state:
             st.error("Run SFF first before saving outputs.")
@@ -542,7 +599,15 @@ def main() -> None:
                 except OSError:
                     ok5 = False
 
-            if ok1 and ok2 and ok3 and ok4 and ok5:
+            ok6 = True
+            lesion_mask = st.session_state.get("lesion_mask")
+            lesion_overlay = st.session_state.get("lesion_overlay_bgr")
+            if lesion_mask is not None:
+                ok6 = save_image(outputs / "lesion_mask.png", lesion_mask)
+            if lesion_overlay is not None and ok6:
+                ok6 = save_image(outputs / "lesion_overlay.png", lesion_overlay)
+
+            if ok1 and ok2 and ok3 and ok4 and ok5 and ok6:
                 st.success("Saved outputs to ./outputs/")
             else:
                 st.error("Failed to save one or more output images.")
